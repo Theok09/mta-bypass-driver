@@ -102,7 +102,7 @@ NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(
     PEPROCESS *Process
 );
 
-NTKERNELAPI PETHREAD PsGetNextProcessThread(
+typedef PETHREAD (NTAPI *PsGetNextProcessThread_t)(
     PEPROCESS Process,
     PETHREAD Thread
 );
@@ -426,7 +426,11 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
     RtlInitUnicodeString(&funcName, L"LdrLoadDll");
     PVOID ldrLoadDll = MmGetSystemRoutineAddress(&funcName);
 
-    PETHREAD thread = PsGetNextProcessThread(process, NULL);
+    UNICODE_STRING pgnptName;
+    RtlInitUnicodeString(&pgnptName, L"PsGetNextProcessThread");
+    PsGetNextProcessThread_t pGetNextThread =
+        (PsGetNextProcessThread_t)MmGetSystemRoutineAddress(&pgnptName);
+    PETHREAD thread = pGetNextThread ? pGetNextThread(process, NULL) : NULL;
     if (!thread) {
         ObDereferenceObject(process);
         DbgPrint("[MtaBypass] No thread found in target process\n");
