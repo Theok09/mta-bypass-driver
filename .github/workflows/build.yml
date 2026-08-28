@@ -6,61 +6,28 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Find SDK version
+      - name: Find WDK version
+        id: wdk
         shell: pwsh
         run: |
-          $sdkVersions = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Sort-Object Name -Descending
-          if ($sdkVersions) {
-            $sdkVer = $sdkVersions[0].Name
-            Write-Host "SDK Version: $sdkVer"
-            echo "SDK_VERSION=$sdkVer" >> $env:GITHUB_ENV
-          } else {
-            Write-Host "No Windows SDK found"
-            exit 1
-          }
-          $kmPath = "C:\Program Files (x86)\Windows Kits\10\Include\$sdkVer\km"
-          if (Test-Path $kmPath) {
-            Write-Host "KM headers found at $kmPath"
-            echo "NEED_WDK=false" >> $env:GITHUB_ENV
-          } else {
-            Write-Host "KM headers not found, need WDK"
-            echo "NEED_WDK=true" >> $env:GITHUB_ENV
-          }
-
-      - name: Install WDK
-        if: env.NEED_WDK == 'true'
-        shell: pwsh
-        run: |
-          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
-          Write-Host "Downloading WDK..."
-          Invoke-WebRequest -Uri $wdkUrl -OutFile wdksetup.exe -UseBasicParsing
-          Write-Host "Installing WDK..."
-          Start-Process -FilePath .\wdksetup.exe -ArgumentList "/quiet","/norestart" -Wait
-          Write-Host "WDK installed"
+          $kmPath = "C:\Program Files (x86)\Windows Kits\10\Include"
+          $ver = Get-ChildItem $kmPath | Where-Object { Test-Path "$($_.FullName)\km\ntddk.h" } | Sort-Object Name -Descending | Select-Object -First 1
+          "version=$($ver.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "WDK version: $($ver.Name)"
 
       - name: Build driver
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           set "WDK=C:\Program Files (x86)\Windows Kits\10"
-          set "SDK_VER=%SDK_VERSION%"
-          cl /kernel /W3 /GS- /Gz /O2 /D_AMD64_ /DNTDDI_VERSION=0x0A000000 /DWINVER=0x0A00 /I"%WDK%\Include\%SDK_VER%\km" /I"%WDK%\Include\%SDK_VER%\shared" /I"%WDK%\Include\%SDK_VER%\um" mta_bypass.c /link /DRIVER:WDM /ENTRY:DriverEntry /SUBSYSTEM:NATIVE /LIBPATH:"%WDK%\Lib\%SDK_VER%\km\x64" ntoskrnl.lib hal.lib BufferOverflowFastFailK.lib /OUT:mta_bypass.sys
-
-      - name: Verify output
-        shell: pwsh
-        run: |
-          if (Test-Path mta_bypass.sys) {
-            $size = (Get-Item mta_bypass.sys).Length
-            Write-Host "Built mta_bypass.sys - $size bytes"
-          } else {
-            Write-Host "Build failed"
-            exit 1
-          }
+          set "SV=${{ steps.wdk.outputs.version }}"
+          cl.exe /c /kernel /W3 /GS- /Gz /O2 /D_AMD64_ /D_WIN64 /DNTDDI_VERSION=0x0A000000 /I"%WDK%\Include\%SV%\km" /I"%WDK%\Include\%SV%\shared" /I"%WDK%\Include\%SV%\km\crt" /Fo mta_bypass.obj mta_bypass.c
+          link.exe /OUT:mta_bypass.sys /DRIVER:WDM /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /NODEFAULTLIB /LIBPATH:"%WDK%\Lib\%SV%\km\x64" ntoskrnl.lib hal.lib wmilib.lib mta_bypass.obj
 
       - name: Upload driver
         uses: actions/upload-artifact@v4

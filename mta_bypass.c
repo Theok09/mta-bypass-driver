@@ -14,14 +14,78 @@
 #define IOCTL_INJECT_DLL           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_STATUS               CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* ─── Undocumented APC definitions ─── */
+
+typedef enum _KAPC_ENVIRONMENT {
+    OriginalApcEnvironment,
+    AttachedApcEnvironment,
+    CurrentApcEnvironment,
+    InsertApcEnvironment
+} KAPC_ENVIRONMENT;
+
+typedef VOID (NTAPI *PKKERNEL_ROUTINE)(
+    struct _KAPC *Apc,
+    PKNORMAL_ROUTINE *NormalRoutine,
+    PVOID *NormalContext,
+    PVOID *SystemArgument1,
+    PVOID *SystemArgument2
+);
+
+typedef VOID (NTAPI *PKRUNDOWN_ROUTINE)(struct _KAPC *Apc);
+
+NTKERNELAPI VOID KeInitializeApc(
+    PRKAPC Apc,
+    PRKTHREAD Thread,
+    KAPC_ENVIRONMENT Environment,
+    PKKERNEL_ROUTINE KernelRoutine,
+    PKRUNDOWN_ROUTINE RundownRoutine,
+    PKNORMAL_ROUTINE NormalRoutine,
+    KPROCESSOR_MODE ProcessorMode,
+    PVOID NormalContext
+);
+
+NTKERNELAPI BOOLEAN KeInsertQueueApc(
+    PRKAPC Apc,
+    PVOID SystemArgument1,
+    PVOID SystemArgument2,
+    KPRIORITY Increment
+);
+
+NTKERNELAPI BOOLEAN KeAlertThread(
+    PRKTHREAD Thread,
+    KPROCESSOR_MODE AlertMode
+);
+
+NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(
+    HANDLE ProcessId,
+    PEPROCESS *Process
+);
+
+NTKERNELAPI PETHREAD PsGetNextProcessThread(
+    PEPROCESS Process,
+    PETHREAD Thread
+);
+
+NTSYSAPI NTSTATUS NTAPI ZwAllocateVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID *BaseAddress,
+    ULONG_PTR ZeroBits,
+    PSIZE_T RegionSize,
+    ULONG AllocationType,
+    ULONG Protect
+);
+
+NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
+
 /* ─── Types ─── */
 
 typedef NTSTATUS (*PsSetLoadImageNotifyRoutine_t)(PLOAD_IMAGE_NOTIFY_ROUTINE);
-typedef NTSTATUS (*PsRemoveLoadImageNotifyRoutine_t)(PLOAD_IMAGE_NOTIFY_ROUTINE);
 typedef NTSTATUS (*PsSetCreateThreadNotifyRoutine_t)(PCREATE_THREAD_NOTIFY_ROUTINE);
-typedef NTSTATUS (*PsRemoveCreateThreadNotifyRoutine_t)(PCREATE_THREAD_NOTIFY_ROUTINE);
-
-typedef NTSTATUS (*ZwQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
 
 typedef struct _SYSTEM_MODULE_ENTRY {
     HANDLE Section;
@@ -52,16 +116,6 @@ typedef struct _STATUS_RESPONSE {
     ULONG  InjectionsPerformed;
 } STATUS_RESPONSE, *PSTATUS_RESPONSE;
 
-typedef struct _KAPC_STATE {
-    LIST_ENTRY ApcListHead[2];
-    PKPROCESS  Process;
-    BOOLEAN    KernelApcInProgress;
-    BOOLEAN    KernelApcPending;
-    BOOLEAN    UserApcPending;
-} KAPC_STATE, *PKAPC_STATE;
-
-typedef VOID (*KeStackAttachProcess_t)(PEPROCESS, PKAPC_STATE);
-typedef VOID (*KeUnstackDetachProcess_t)(PKAPC_STATE);
 
 /* ─── Globals ─── */
 
@@ -104,18 +158,15 @@ static PVOID GetNtoskrnlBase(PULONG outSize)
 {
     NTSTATUS status;
     ULONG bufSize = 0;
-    ZwQuerySystemInformation_t ZwQSI = (ZwQuerySystemInformation_t)
-        MmGetSystemRoutineAddress(&(UNICODE_STRING)RTL_CONSTANT_STRING(L"ZwQuerySystemInformation"));
-    if (!ZwQSI) return NULL;
 
-    ZwQSI(11 /* SystemModuleInformation */, NULL, 0, &bufSize);
+    ZwQuerySystemInformation(11 /* SystemModuleInformation */, NULL, 0, &bufSize);
     if (!bufSize) return NULL;
 
     PSYSTEM_MODULE_INFORMATION modInfo = (PSYSTEM_MODULE_INFORMATION)
         ExAllocatePool2(POOL_FLAG_NON_PAGED, bufSize, 'bypM');
     if (!modInfo) return NULL;
 
-    status = ZwQSI(11, modInfo, bufSize, &bufSize);
+    status = ZwQuerySystemInformation(11, modInfo, bufSize, &bufSize);
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(modInfo, 'bypM');
         return NULL;
@@ -255,13 +306,24 @@ typedef struct _PE_HEADERS {
     USHORT Characteristics;
 } PE_HEADERS;
 
+static VOID NTAPI ApcKernelCleanup(
+    PKAPC Apc,
+    PKNORMAL_ROUTINE *NormalRoutine,
+    PVOID *NormalContext,
+    PVOID *SystemArgument1,
+    PVOID *SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(NormalRoutine);
+    UNREFERENCED_PARAMETER(NormalContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+    ExFreePoolWithTag(Apc, 'bypM');
+}
+
 static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
 {
     NTSTATUS status;
     PEPROCESS process = NULL;
-    HANDLE hProcess = NULL;
-    OBJECT_ATTRIBUTES oa;
-    CLIENT_ID cid;
 
     status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)processId, &process);
     if (!NT_SUCCESS(status)) {
@@ -269,29 +331,10 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
         return status;
     }
 
-    /*
-     * Allocate memory in target process for the DLL path,
-     * then queue a user-mode APC that calls LoadLibraryW
-     */
-
     KAPC_STATE apcState;
-    UNICODE_STRING funcName;
 
-    /* Get KeStackAttachProcess / KeUnstackDetachProcess */
-    RtlInitUnicodeString(&funcName, L"KeStackAttachProcess");
-    KeStackAttachProcess_t pAttach = (KeStackAttachProcess_t)MmGetSystemRoutineAddress(&funcName);
-    RtlInitUnicodeString(&funcName, L"KeUnstackDetachProcess");
-    KeUnstackDetachProcess_t pDetach = (KeUnstackDetachProcess_t)MmGetSystemRoutineAddress(&funcName);
+    KeStackAttachProcess(process, &apcState);
 
-    if (!pAttach || !pDetach) {
-        ObDereferenceObject(process);
-        return STATUS_NOT_FOUND;
-    }
-
-    /* Attach to target process context */
-    pAttach(process, &apcState);
-
-    /* Allocate user-mode memory for DLL path */
     SIZE_T pathLen = (wcslen(dllPath) + 1) * sizeof(WCHAR);
     SIZE_T allocSize = pathLen;
     PVOID remoteBuf = NULL;
@@ -300,40 +343,21 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
                                      &allocSize, MEM_COMMIT | MEM_RESERVE,
                                      PAGE_READWRITE);
     if (!NT_SUCCESS(status)) {
-        pDetach(&apcState);
+        KeUnstackDetachProcess(&apcState);
         ObDereferenceObject(process);
         DbgPrint("[MtaBypass] ZwAllocateVirtualMemory failed: 0x%X\n", status);
         return status;
     }
 
-    /* Copy DLL path to target */
     __try {
         RtlCopyMemory(remoteBuf, dllPath, pathLen);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        pDetach(&apcState);
+        KeUnstackDetachProcess(&apcState);
         ObDereferenceObject(process);
         return STATUS_ACCESS_VIOLATION;
     }
 
-    pDetach(&apcState);
-
-    /*
-     * Find LoadLibraryW in kernel32/ntdll for the target process.
-     * We use a shellcode stub that calls LdrLoadDll (ntdll) since
-     * kernel32 might not be loaded yet.
-     *
-     * For simplicity, we resolve LdrLoadDll from ntdll's export table
-     * by walking PEB->Ldr in the target.
-     *
-     * Alternative: Queue APC with NormalRoutine pointing to LdrLoadDll,
-     * passing the UNICODE_STRING for the DLL path.
-     */
-
-    /* Build UNICODE_STRING in target process memory */
-    pAttach(process, &apcState);
-
-    SIZE_T ustrSize = sizeof(UNICODE_STRING) + pathLen;
-    SIZE_T ustrAlloc = ustrSize;
+    SIZE_T ustrAlloc = sizeof(UNICODE_STRING);
     PVOID ustrBuf = NULL;
 
     status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &ustrBuf, 0,
@@ -350,44 +374,24 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
         }
     }
 
-    pDetach(&apcState);
+    KeUnstackDetachProcess(&apcState);
 
     if (!NT_SUCCESS(status)) {
         ObDereferenceObject(process);
         return status;
     }
 
-    /* Resolve LdrLoadDll from ntdll */
+    UNICODE_STRING funcName;
     RtlInitUnicodeString(&funcName, L"LdrLoadDll");
     PVOID ldrLoadDll = MmGetSystemRoutineAddress(&funcName);
 
-    /* Queue user-mode APC to alertable thread */
-    PETHREAD thread = NULL;
-    HANDLE threadId = NULL;
-
-    /* Find first thread of the target process */
-    pAttach(process, &apcState);
-
-    /* Walk thread list — simplified: use PsGetNextProcessThread */
-    UNICODE_STRING nextThreadName;
-    RtlInitUnicodeString(&nextThreadName, L"PsGetNextProcessThread");
-    typedef PETHREAD (*PsGetNextProcessThread_t)(PEPROCESS, PETHREAD);
-    PsGetNextProcessThread_t pGetNext =
-        (PsGetNextProcessThread_t)MmGetSystemRoutineAddress(&nextThreadName);
-
-    pDetach(&apcState);
-
-    if (pGetNext) {
-        thread = pGetNext(process, NULL);
-    }
-
+    PETHREAD thread = PsGetNextProcessThread(process, NULL);
     if (!thread) {
         ObDereferenceObject(process);
         DbgPrint("[MtaBypass] No thread found in target process\n");
         return STATUS_NOT_FOUND;
     }
 
-    /* Allocate and initialize KAPC */
     PKAPC apc = (PKAPC)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KAPC), 'bypM');
     if (!apc) {
         ObDereferenceObject(process);
@@ -395,23 +399,22 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
     }
 
     KeInitializeApc(apc,
-                    thread,
+                    (PRKTHREAD)thread,
                     OriginalApcEnvironment,
-                    (PKKERNEL_ROUTINE)ExFreePoolWithTag, /* KernelRoutine — frees the APC */
-                    NULL,                                 /* RundownRoutine */
-                    (PKNORMAL_ROUTINE)ldrLoadDll,        /* NormalRoutine — LdrLoadDll */
+                    ApcKernelCleanup,
+                    NULL,
+                    (PKNORMAL_ROUTINE)ldrLoadDll,
                     UserMode,
-                    ustrBuf);                            /* NormalContext — UNICODE_STRING* */
+                    ustrBuf);
 
-    if (!KeInsertQueueApc(apc, NULL /* handle out */, NULL, IO_NO_INCREMENT)) {
+    if (!KeInsertQueueApc(apc, NULL, NULL, IO_NO_INCREMENT)) {
         ExFreePoolWithTag(apc, 'bypM');
         ObDereferenceObject(process);
         DbgPrint("[MtaBypass] KeInsertQueueApc failed\n");
         return STATUS_UNSUCCESSFUL;
     }
 
-    /* Force thread to alertable state to deliver APC */
-    KeAlertThread(thread, UserMode);
+    KeAlertThread((PRKTHREAD)thread, UserMode);
 
     g_Injections++;
     ObDereferenceObject(process);
