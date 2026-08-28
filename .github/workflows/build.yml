@@ -1,0 +1,85 @@
+name: Build mta_bypass.sys
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find WDK and VS paths
+        shell: pwsh
+        run: |
+          # Windows 2022 runner has VS 2022 + Windows SDK pre-installed
+          # WDK might need install — check first
+          $sdkVersions = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+          if ($sdkVersions) {
+            $sdkVer = $sdkVersions[0].Name
+            Write-Host "SDK Version: $sdkVer"
+            echo "SDK_VERSION=$sdkVer" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "No Windows SDK found"
+            exit 1
+          }
+
+          # Check for km headers
+          $kmPath = "C:\Program Files (x86)\Windows Kits\10\Include\$sdkVer\km"
+          if (Test-Path $kmPath) {
+            Write-Host "KM headers found at $kmPath"
+          } else {
+            Write-Host "KM headers NOT found — need WDK"
+            echo "NEED_WDK=true" >> $env:GITHUB_ENV
+          }
+
+      - name: Install WDK
+        if: env.NEED_WDK == 'true'
+        shell: pwsh
+        run: |
+          # Download and install WDK silently
+          $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2196230"
+          Write-Host "Downloading WDK..."
+          Invoke-WebRequest -Uri $wdkUrl -OutFile wdksetup.exe -UseBasicParsing
+          Write-Host "Installing WDK..."
+          Start-Process -FilePath .\wdksetup.exe -ArgumentList "/quiet","/norestart" -Wait
+          Write-Host "WDK installed"
+
+      - name: Build driver
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+
+          set WDK=C:\Program Files (x86)\Windows Kits\10
+          set SDK_VER=%SDK_VERSION%
+
+          cl /kernel /W3 /GS- /Gz /O2 ^
+             /D_AMD64_ /DNTDDI_VERSION=0x0A000000 /DWINVER=0x0A00 ^
+             /I"%WDK%\Include\%SDK_VER%\km" ^
+             /I"%WDK%\Include\%SDK_VER%\shared" ^
+             /I"%WDK%\Include\%SDK_VER%\um" ^
+             mta_bypass.c ^
+             /link /DRIVER:WDM /ENTRY:DriverEntry /SUBSYSTEM:NATIVE ^
+             /LIBPATH:"%WDK%\Lib\%SDK_VER%\km\x64" ^
+             ntoskrnl.lib hal.lib BufferOverflowFastFailK.lib ^
+             /OUT:mta_bypass.sys
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          if (Test-Path mta_bypass.sys) {
+            $size = (Get-Item mta_bypass.sys).Length
+            Write-Host "mta_bypass.sys built successfully — $size bytes"
+          } else {
+            Write-Host "Build failed — no output"
+            exit 1
+          }
+
+      - name: Upload driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: mta_bypass_driver
+          path: mta_bypass.sys
+          retention-days: 30
