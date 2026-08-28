@@ -23,9 +23,15 @@ typedef enum _KAPC_ENVIRONMENT {
     InsertApcEnvironment
 } KAPC_ENVIRONMENT;
 
+typedef VOID (NTAPI *PKNORMAL_ROUTINE_T)(
+    PVOID NormalContext,
+    PVOID SystemArgument1,
+    PVOID SystemArgument2
+);
+
 typedef VOID (NTAPI *PKKERNEL_ROUTINE)(
     struct _KAPC *Apc,
-    PKNORMAL_ROUTINE *NormalRoutine,
+    PKNORMAL_ROUTINE_T *NormalRoutine,
     PVOID *NormalContext,
     PVOID *SystemArgument1,
     PVOID *SystemArgument2
@@ -39,7 +45,7 @@ NTKERNELAPI VOID KeInitializeApc(
     KAPC_ENVIRONMENT Environment,
     PKKERNEL_ROUTINE KernelRoutine,
     PKRUNDOWN_ROUTINE RundownRoutine,
-    PKNORMAL_ROUTINE NormalRoutine,
+    PKNORMAL_ROUTINE_T NormalRoutine,
     KPROCESSOR_MODE ProcessorMode,
     PVOID NormalContext
 );
@@ -308,7 +314,7 @@ typedef struct _PE_HEADERS {
 
 static VOID NTAPI ApcKernelCleanup(
     PKAPC Apc,
-    PKNORMAL_ROUTINE *NormalRoutine,
+    PKNORMAL_ROUTINE_T *NormalRoutine,
     PVOID *NormalContext,
     PVOID *SystemArgument1,
     PVOID *SystemArgument2)
@@ -403,7 +409,7 @@ static NTSTATUS InjectDllViaApc(ULONG processId, PCWSTR dllPath)
                     OriginalApcEnvironment,
                     ApcKernelCleanup,
                     NULL,
-                    (PKNORMAL_ROUTINE)ldrLoadDll,
+                    (PKNORMAL_ROUTINE_T)ldrLoadDll,
                     UserMode,
                     ustrBuf);
 
