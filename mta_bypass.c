@@ -3,26 +3,20 @@
  * Designed for manual mapping via kdmapper
  *
  * - No IoCreateDevice (fake DriverObject from kdmapper)
- * - No IOCTL (no device object)
- * - ExAllocatePoolWithTag instead of ExAllocatePool2 (compat)
- * - Patches callback bodies with RET instead of zeroing slots (PatchGuard safe)
- * - PsCreateSystemThread for async work, DriverEntry returns fast
+ * - ExAllocatePoolWithTag (compat all Windows versions)
+ * - Patches callback bodies with RET (PatchGuard safe)
+ * - Runs synchronously in DriverEntry (no worker thread — avoids use-after-free)
  */
 
 #include <ntddk.h>
 
-/* ─── Forward declarations for undocumented APIs ─── */
+/* ─── Forward declarations ─── */
 
 NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
     ULONG SystemInformationLength,
     PULONG ReturnLength
-);
-
-NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(
-    HANDLE ProcessId,
-    PEPROCESS *Process
 );
 
 /* ─── Types ─── */
@@ -52,21 +46,30 @@ static ULONG g_CallbacksPatched = 0;
 #define MAX_CALLBACKS 64
 #define POOL_TAG 'bypM'
 
-/* ─── Ntoskrnl base lookup ─── */
+/* ─── Ntoskrnl base lookup (with retry) ─── */
 
 static PVOID GetNtoskrnlBase(PULONG outSize)
 {
     ULONG bufSize = 0;
+    NTSTATUS status;
 
     ZwQuerySystemInformation(11, NULL, 0, &bufSize);
     if (!bufSize) return NULL;
+
+    /* Add extra space in case modules load between calls */
+    bufSize += 4096;
 
     PSYSTEM_MODULE_INFORMATION modInfo = (PSYSTEM_MODULE_INFORMATION)
         ExAllocatePoolWithTag(NonPagedPool, bufSize, POOL_TAG);
     if (!modInfo) return NULL;
 
-    NTSTATUS status = ZwQuerySystemInformation(11, modInfo, bufSize, &bufSize);
+    status = ZwQuerySystemInformation(11, modInfo, bufSize, &bufSize);
     if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(modInfo, POOL_TAG);
+        return NULL;
+    }
+
+    if (modInfo->Count == 0) {
         ExFreePoolWithTag(modInfo, POOL_TAG);
         return NULL;
     }
@@ -77,54 +80,80 @@ static PVOID GetNtoskrnlBase(PULONG outSize)
     return base;
 }
 
-/* ─── Callback array finder ─── */
+/* ─── Callback array finder (bounds-checked) ─── */
 
-static PVOID* FindCallbackArray(PVOID exportAddr, ULONG scanRange)
+static PVOID* FindCallbackArray(PVOID exportAddr, ULONG scanRange,
+                                 PVOID ntBase, ULONG ntSize)
 {
-    if (!exportAddr || !MmIsAddressValid(exportAddr)) return NULL;
+    if (!exportAddr) return NULL;
+
+    /* Clamp scan range to ntoskrnl image bounds */
+    ULONG_PTR exportEnd = (ULONG_PTR)exportAddr + scanRange;
+    ULONG_PTR imageEnd = (ULONG_PTR)ntBase + ntSize;
+    if (exportEnd > imageEnd) {
+        scanRange = (ULONG)(imageEnd - (ULONG_PTR)exportAddr);
+    }
+    if (scanRange < 7) return NULL;
 
     UCHAR* scan = (UCHAR*)exportAddr;
-    for (ULONG i = 0; i < scanRange - 7; i++) {
-        if ((scan[i] == 0x48 || scan[i] == 0x4C) &&
-            scan[i+1] == 0x8D &&
-            (scan[i+2] & 0xC7) == 0x05) {
 
-            LONG disp = *(LONG*)(&scan[i+3]);
-            PVOID* array = (PVOID*)((ULONG_PTR)&scan[i+7] + disp);
+    __try {
+        for (ULONG i = 0; i < scanRange - 7; i++) {
+            if ((scan[i] == 0x48 || scan[i] == 0x4C) &&
+                scan[i+1] == 0x8D &&
+                (scan[i+2] & 0xC7) == 0x05) {
 
-            if (MmIsAddressValid(array)) {
-                DbgPrint("[MtaBypass] Callback array at %p (export+0x%x)\n", array, i);
-                return array;
+                LONG disp = *(LONG*)(&scan[i+3]);
+                PVOID* array = (PVOID*)((ULONG_PTR)&scan[i+7] + disp);
+
+                /* Validate array is within kernel space */
+                if ((ULONG_PTR)array > 0xFFFF800000000000ULL) {
+                    DbgPrint("[MtaBypass] Callback array at %p (export+0x%x)\n", array, i);
+                    return array;
+                }
             }
         }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DbgPrint("[MtaBypass] Exception in FindCallbackArray\n");
     }
+
     return NULL;
 }
 
 /*
  * PatchGuard-safe callback neutralization:
- * Instead of zeroing callback array slots (PatchGuard monitors these),
- * we patch the callback function body with a RET instruction.
- * This leaves the array intact but makes the callback a no-op.
+ * Patches callback function body with RET (0xC3) instead of zeroing array slots.
+ * All memory access wrapped in SEH for safety.
  */
-static ULONG PatchCallbacks(PVOID* callbackArray, ULONG maxSlots)
+static ULONG PatchCallbacks(PVOID* callbackArray, ULONG maxSlots,
+                             PVOID ntBase, ULONG ntSize)
 {
     ULONG patched = 0;
-    PVOID ntBase = NULL;
-    ULONG ntSize = 0;
-
-    ntBase = GetNtoskrnlBase(&ntSize);
-    if (!ntBase) return 0;
 
     for (ULONG i = 0; i < maxSlots; i++) {
-        PVOID slot = callbackArray[i];
+        PVOID slot = NULL;
+        PVOID block = NULL;
+        PVOID func = NULL;
+
+        __try {
+            slot = callbackArray[i];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            break;
+        }
+
         if (!slot) continue;
 
-        PVOID block = (PVOID)((ULONG_PTR)slot & ~0xF);
-        if (!MmIsAddressValid(block)) continue;
+        /* Strip ref count bits from EX_CALLBACK fast reference */
+        block = (PVOID)((ULONG_PTR)slot & ~0xF);
 
-        PVOID func = *(PVOID*)((ULONG_PTR)block + 0x8);
-        if (!MmIsAddressValid(func)) continue;
+        __try {
+            /* Function pointer at offset 0x8 in EX_CALLBACK_ROUTINE_BLOCK */
+            func = *(PVOID*)((ULONG_PTR)block + 0x8);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+
+        if (!func) continue;
 
         /* Only patch third-party callbacks (outside ntoskrnl) */
         if ((ULONG_PTR)func >= (ULONG_PTR)ntBase &&
@@ -132,25 +161,38 @@ static ULONG PatchCallbacks(PVOID* callbackArray, ULONG maxSlots)
             continue;
         }
 
-        /*
-         * Patch the callback function with RET (0xC3).
-         * We need to make the page writable first.
-         */
+        /* Patch the callback function with RET (0xC3) via MDL */
         PMDL mdl = IoAllocateMdl(func, 1, FALSE, FALSE, NULL);
         if (!mdl) continue;
 
-        MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
-        PVOID mapped = MmMapLockedPagesSpecifyCache(
+        BOOLEAN locked = FALSE;
+        PVOID mapped = NULL;
+
+        __try {
+            MmProbeAndLockPages(mdl, KernelMode, IoModifyAccess);
+            locked = TRUE;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            IoFreeMdl(mdl);
+            continue;
+        }
+
+        mapped = MmMapLockedPagesSpecifyCache(
             mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
 
         if (mapped) {
-            *(UCHAR*)mapped = 0xC3;  /* RET */
+            __try {
+                *(UCHAR*)mapped = 0xC3;  /* RET */
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                /* write failed, skip */
+            }
             MmUnmapLockedPages(mapped, mdl);
             patched++;
-            DbgPrint("[MtaBypass] Patched callback slot %u, func=%p with RET\n", i, func);
+            DbgPrint("[MtaBypass] Patched slot %u, func=%p\n", i, func);
         }
 
-        MmUnlockPages(mdl);
+        if (locked) {
+            MmUnlockPages(mdl);
+        }
         IoFreeMdl(mdl);
     }
 
@@ -161,44 +203,40 @@ static VOID NeutralizeFairplay(void)
 {
     ULONG patched = 0;
     UNICODE_STRING name;
+    PVOID ntBase = NULL;
+    ULONG ntSize = 0;
+
+    ntBase = GetNtoskrnlBase(&ntSize);
+    if (!ntBase || !ntSize) {
+        DbgPrint("[MtaBypass] Failed to get ntoskrnl base.\n");
+        return;
+    }
+
+    DbgPrint("[MtaBypass] ntoskrnl base=%p size=0x%X\n", ntBase, ntSize);
 
     RtlInitUnicodeString(&name, L"PsSetLoadImageNotifyRoutine");
     PVOID addr = MmGetSystemRoutineAddress(&name);
     if (addr) {
-        PVOID* arr = FindCallbackArray(addr, 0x100);
-        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS);
+        PVOID* arr = FindCallbackArray(addr, 0x100, ntBase, ntSize);
+        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS, ntBase, ntSize);
     }
 
     RtlInitUnicodeString(&name, L"PsSetCreateThreadNotifyRoutine");
     addr = MmGetSystemRoutineAddress(&name);
     if (addr) {
-        PVOID* arr = FindCallbackArray(addr, 0x100);
-        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS);
+        PVOID* arr = FindCallbackArray(addr, 0x100, ntBase, ntSize);
+        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS, ntBase, ntSize);
     }
 
     RtlInitUnicodeString(&name, L"PsSetCreateProcessNotifyRoutine");
     addr = MmGetSystemRoutineAddress(&name);
     if (addr) {
-        PVOID* arr = FindCallbackArray(addr, 0x100);
-        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS);
+        PVOID* arr = FindCallbackArray(addr, 0x100, ntBase, ntSize);
+        if (arr) patched += PatchCallbacks(arr, MAX_CALLBACKS, ntBase, ntSize);
     }
 
     g_CallbacksPatched = patched;
-    DbgPrint("[MtaBypass] Neutralization done. %u callbacks patched with RET.\n", patched);
-}
-
-/* ─── Worker thread ─── */
-
-static VOID WorkerThread(PVOID context)
-{
-    UNREFERENCED_PARAMETER(context);
-
-    DbgPrint("[MtaBypass] Worker thread started.\n");
-
-    NeutralizeFairplay();
-
-    DbgPrint("[MtaBypass] Worker thread done. Exiting.\n");
-    PsTerminateSystemThread(STATUS_SUCCESS);
+    DbgPrint("[MtaBypass] Done. %u callbacks patched with RET.\n", patched);
 }
 
 /* ─── Driver Entry ─── */
@@ -209,28 +247,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     UNREFERENCED_PARAMETER(RegistryPath);
 
     /*
-     * kdmapper passes fake DriverObject. Do NOT use it.
-     * Spawn a system thread to do the real work and return immediately.
+     * kdmapper passes fake DriverObject — do NOT use it.
+     * Run synchronously — no worker thread.
+     * Worker thread would execute from mapped memory that kdmapper frees
+     * after DriverEntry returns = use-after-free BSOD.
      */
 
-    HANDLE threadHandle = NULL;
-    NTSTATUS status = PsCreateSystemThread(
-        &threadHandle,
-        THREAD_ALL_ACCESS,
-        NULL,
-        NULL,
-        NULL,
-        WorkerThread,
-        NULL
-    );
-
-    if (NT_SUCCESS(status)) {
-        ZwClose(threadHandle);
-        DbgPrint("[MtaBypass] Worker thread spawned. Returning from DriverEntry.\n");
-    } else {
-        DbgPrint("[MtaBypass] Failed to create worker thread: 0x%X. Running inline.\n", status);
-        NeutralizeFairplay();
-    }
+    DbgPrint("[MtaBypass] DriverEntry start.\n");
+    NeutralizeFairplay();
+    DbgPrint("[MtaBypass] DriverEntry done. Patched %u callbacks.\n", g_CallbacksPatched);
 
     return STATUS_SUCCESS;
 }
