@@ -16,6 +16,41 @@
 
 /* ─── Undocumented APC definitions ─── */
 
+typedef struct _KAPC_STATE {
+    LIST_ENTRY ApcListHead[2];
+    struct _KPROCESS *Process;
+    union {
+        UCHAR InProgressFlags;
+        struct {
+            BOOLEAN KernelApcInProgress : 1;
+            BOOLEAN SpecialApcInProgress : 1;
+        };
+    };
+    BOOLEAN KernelApcPending;
+    union {
+        BOOLEAN UserApcPendingAll;
+        struct {
+            BOOLEAN SpecialUserApcPending : 1;
+            BOOLEAN UserApcPending : 1;
+        };
+    };
+} KAPC_STATE, *PKAPC_STATE, *PRKAPC_STATE;
+
+NTKERNELAPI VOID KeStackAttachProcess(
+    PEPROCESS Process,
+    PRKAPC_STATE ApcState
+);
+
+NTKERNELAPI VOID KeUnstackDetachProcess(
+    PRKAPC_STATE ApcState
+);
+
+NTKERNELAPI PVOID ExAllocatePool2(
+    POOL_FLAGS Flags,
+    SIZE_T NumberOfBytes,
+    ULONG Tag
+);
+
 typedef enum _KAPC_ENVIRONMENT {
     OriginalApcEnvironment,
     AttachedApcEnvironment,
