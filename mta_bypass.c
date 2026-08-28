@@ -542,27 +542,42 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    NTSTATUS status;
-    UNICODE_STRING devName, symlink;
+    DbgPrint("[MtaBypass] DriverEntry called.\n");
 
-    RtlInitUnicodeString(&devName, DEVICE_NAME);
-    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
+    /*
+     * kdmapper manual-maps the driver, so DriverObject may be NULL/fake.
+     * Try to create device only if DriverObject looks valid.
+     * If it fails, run in "fire and forget" mode: neutralize and return.
+     */
+    if (DriverObject && MmIsAddressValid(DriverObject)) {
+        NTSTATUS status;
+        UNICODE_STRING devName, symlink;
 
-    status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
-                            FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
-    if (!NT_SUCCESS(status)) return status;
+        RtlInitUnicodeString(&devName, DEVICE_NAME);
+        RtlInitUnicodeString(&symlink, SYMLINK_NAME);
 
-    status = IoCreateSymbolicLink(&symlink, &devName);
-    if (!NT_SUCCESS(status)) {
-        IoDeleteDevice(g_DeviceObject);
-        return status;
+        status = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
+                                FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+        if (NT_SUCCESS(status)) {
+            status = IoCreateSymbolicLink(&symlink, &devName);
+            if (NT_SUCCESS(status)) {
+                DriverObject->MajorFunction[IRP_MJ_CREATE]         = DeviceCreateClose;
+                DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DeviceCreateClose;
+                DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControl;
+                DriverObject->DriverUnload                          = DriverUnload;
+                DbgPrint("[MtaBypass] Device created. IOCTL mode active.\n");
+                return STATUS_SUCCESS;
+            } else {
+                IoDeleteDevice(g_DeviceObject);
+                g_DeviceObject = NULL;
+            }
+        }
+        DbgPrint("[MtaBypass] Device creation failed. Running fire-and-forget.\n");
     }
 
-    DriverObject->MajorFunction[IRP_MJ_CREATE]         = DeviceCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DeviceCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DeviceControl;
-    DriverObject->DriverUnload                          = DriverUnload;
-
-    DbgPrint("[MtaBypass] Driver loaded. Device: %wZ\n", &devName);
+    /* Fire-and-forget: neutralize immediately */
+    DbgPrint("[MtaBypass] Running immediate neutralization.\n");
+    NeutralizeFairplay();
+    DbgPrint("[MtaBypass] Neutralization done. Callbacks removed: %u\n", g_CallbacksRemoved);
     return STATUS_SUCCESS;
 }
